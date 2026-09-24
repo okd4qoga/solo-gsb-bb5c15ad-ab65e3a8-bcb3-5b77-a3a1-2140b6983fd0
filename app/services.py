@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections import defaultdict
 
@@ -130,7 +131,7 @@ def import_events(
             (inserted, len(skipped), import_id),
         )
 
-    return {
+    result = {
         "import_id": import_id,
         "total_rows": len(rows),
         "inserted": inserted,
@@ -138,6 +139,12 @@ def import_events(
         "skipped": len(skipped),
         "skipped_details": skipped[:100],
     }
+    # New or back-filled samples (including late samples at old timestamps)
+    # change every rule's truth model: recompute the stored faults so they
+    # never go stale against the latest data and configured TTLs.
+    if db.query_one("SELECT COUNT(*) AS c FROM rules")["c"]:
+        result["evaluation"] = evaluate_all_rules()
+    return result
 
 
 def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | None]:
@@ -172,19 +179,31 @@ def _load_maintenance_windows() -> list[MaintenanceWindow]:
     ]
 
 
+def _load_sample_ttls() -> dict[tuple[str, str], float]:
+    """Configured per-channel sample validity windows keyed by (device, metric)."""
+    return {
+        (t["device"], t["metric"]): float(t["ttl_seconds"])
+        for t in db.fetch_sample_ttls()
+    }
+
+
 def evaluate_all_rules() -> dict:
     """Re-evaluate every rule and replace its stored fault intervals.
 
-    Planned-maintenance windows are merged per device and subtracted from the
-    truth segments before the duration check, so a maintenance interruption
-    resets the sustained duration and re-arms confirmation after the window.
-    The suppressed pieces are stored alongside for the timeline/export.
+    Per-channel sample validity (TTL) clips every held piece at
+    ``sample.ts + ttl`` so expired gaps reset the sustained duration and are
+    never bridged. Planned-maintenance windows are then merged per device
+    and subtracted from the truth segments before the duration check, so a
+    maintenance interruption likewise resets the sustained duration and
+    re-arms confirmation after the window. The suppressed pieces are stored
+    alongside for the timeline/export.
     """
     rules = db.fetch_rules()
     events_by_channel, horizon = _load_events_index()
     if horizon is None:
         horizon = 0.0
     maintenance = _load_maintenance_windows()
+    sample_ttls = _load_sample_ttls()
 
     total = 0
     total_suppressed = 0
@@ -200,6 +219,7 @@ def evaluate_all_rules() -> dict:
                 events_by_channel=events_by_channel,
                 horizon=horizon,
                 maintenance=maintenance,
+                sample_ttls=sample_ttls,
             )
             tx.execute("DELETE FROM fault_intervals WHERE rule_id = ?", (rule["id"],))
             tx.execute("DELETE FROM suppressed_segments WHERE rule_id = ?", (rule["id"],))
@@ -251,6 +271,7 @@ def evaluate_all_rules() -> dict:
         "fault_intervals": total,
         "suppressed_segments": total_suppressed,
         "maintenance_windows": len(maintenance),
+        "sample_ttls": len(sample_ttls),
         "per_rule": per_rule,
     }
 
@@ -271,15 +292,17 @@ def preview_rule(rule_id: int | None, draft: dict) -> dict:
 
     The baseline is the rule *as currently stored* (or nothing for a new
     rule), the candidate is the unsaved draft.  Both are evaluated right now
-    with the current events and the currently stored planned-maintenance
-    windows — exactly what a save + re-evaluation would see — but nothing is
-    written to the rules or fault tables.  The two confirmed fault sets are
-    compared as half-open interval coverings (see :func:`diff_faults`).
+    with the current events, the currently stored planned-maintenance
+    windows and the current per-channel sample validity TTLs — exactly what
+    a save + re-evaluation would see — but nothing is written to the rules,
+    TTL or fault tables.  The two confirmed fault sets are compared as
+    half-open interval coverings (see :func:`diff_faults`).
     """
     events_by_channel, horizon = _load_events_index()
     if horizon is None:
         horizon = 0.0
     maintenance = _load_maintenance_windows()
+    sample_ttls = _load_sample_ttls()
 
     baseline_rule = db.fetch_rule(rule_id) if rule_id is not None else None
     if rule_id is not None and baseline_rule is None:
@@ -294,6 +317,7 @@ def preview_rule(rule_id: int | None, draft: dict) -> dict:
             events_by_channel=events_by_channel,
             horizon=horizon,
             maintenance=maintenance,
+            sample_ttls=sample_ttls,
         )
 
     baseline_result = (
@@ -319,6 +343,7 @@ def preview_rule(rule_id: int | None, draft: dict) -> dict:
             "faults": [_fault_outline(f) for f in draft_result.faults],
         },
         "maintenance_windows": len(maintenance),
+        "sample_ttls": len(sample_ttls),
         "diff": {
             "segments": [seg.to_dict() for seg in segments],
             "counts": counts,
@@ -336,7 +361,69 @@ def list_channels() -> list[dict]:
         GROUP BY device, metric ORDER BY device, metric
         """
     )
-    return [dict(r) for r in rows]
+    ttl_by_channel = {(t["device"], t["metric"]): t["ttl_seconds"] for t in db.fetch_sample_ttls()}
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["ttl_seconds"] = ttl_by_channel.get((r["device"], r["metric"]))
+        out.append(item)
+    return out
+
+
+def list_sample_ttls(
+    device: str | None = None, metric: str | None = None
+) -> list[dict]:
+    """Configured sample-validity windows; unconfigured channels are absent."""
+    return db.fetch_sample_ttls(device, metric)
+
+
+def normalize_ttl_seconds(value: object) -> float:
+    """Validate the TTL: a finite, strictly positive number of seconds."""
+    try:
+        ttl = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sample TTL must be a number of seconds") from exc
+    if not math.isfinite(ttl) or ttl <= 0:
+        raise ValueError("sample TTL must be a positive number of seconds (> 0)")
+    return ttl
+
+
+def set_sample_ttl(device: str, metric: str, ttl_seconds: object) -> dict:
+    """Configure (insert/replace) one channel's sample validity, then re-evaluate."""
+    device = str(device).strip()
+    metric = str(metric).strip()
+    if not device or not metric:
+        raise ValueError("sample TTL device and metric are required")
+    ttl = normalize_ttl_seconds(ttl_seconds)
+    saved = db.upsert_sample_ttl(device, metric, ttl, time.time())
+    evaluation = evaluate_all_rules()
+    return {**saved, "evaluation": evaluation_summary(evaluation)}
+
+
+def clear_sample_ttl(device: str, metric: str) -> dict:
+    """Clear one channel's sample validity (back to legacy hold), re-evaluate."""
+    device = str(device).strip()
+    metric = str(metric).strip()
+    deleted = db.delete_sample_ttl(device, metric)
+    if not deleted:
+        raise KeyError(f"no sample TTL configured for {device}/{metric}")
+    evaluation = evaluate_all_rules()
+    return {
+        "device": device,
+        "metric": metric,
+        "deleted": True,
+        "evaluation": evaluation_summary(evaluation),
+    }
+
+
+def evaluation_summary(evaluation: dict) -> dict:
+    """Compact re-evaluation summary embedded in mutation responses."""
+    return {
+        "rules_evaluated": evaluation["rules_evaluated"],
+        "fault_intervals": evaluation["fault_intervals"],
+        "suppressed_segments": evaluation["suppressed_segments"],
+        "sample_ttls": evaluation["sample_ttls"],
+    }
 
 
 def list_events(
@@ -638,6 +725,7 @@ def timeline_data(start: float | None, end: float | None, max_points: int = 400)
         "annotations": query_annotations(start, end),
         "maintenance": db.fetch_maintenance_windows(start, end),
         "suppressed": query_suppressed(start, end),
+        "sample_ttls": db.fetch_sample_ttls(),
         "data_start": bounds["lo"],
         "data_end": bounds["hi"],
     }

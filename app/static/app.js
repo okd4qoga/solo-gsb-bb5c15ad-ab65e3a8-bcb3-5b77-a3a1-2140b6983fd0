@@ -6,10 +6,12 @@ const PALETTE = ["#ef4444", "#8b5cf6", "#0ea5e9", "#10b981", "#f59e0b", "#ec4899
 const ANN_COLOR = "#f59e0b";
 const MAINT_COLOR = "#0d9488";
 const SUPP_COLOR = "#b45309";
+const TTL_COLOR = "#7c3aed";
 
 const state = {
   rules: [],
   channels: [],
+  sampleTtls: [],
   dataStart: null,
   dataEnd: null,
   viewStart: null,
@@ -21,6 +23,7 @@ const state = {
   selectedFaultId: null,
   editingRuleId: null,
   editingMaintenanceId: null,
+  editingTtl: null, // stored {device, metric, ttl_seconds} when editing
   rulePreview: null,
   eventOffset: 0,
   eventLimit: 200,
@@ -144,6 +147,7 @@ function renderRules() {
   state.channels.forEach((c) => { devs.add(c.device); mets.add(c.metric); });
   state.rules.forEach((r) => r.conditions.forEach((c) => { devs.add(c.device); mets.add(c.metric); }));
   (state.timeline ? state.timeline.maintenance || [] : []).forEach((w) => devs.add(w.device));
+  (state.sampleTtls || []).forEach((t) => { devs.add(t.device); mets.add(t.metric); });
   $("device-list").innerHTML = [...devs].map((d) => `<option value="${esc(d)}">`).join("");
   $("metric-list").innerHTML = [...mets].map((m) => `<option value="${esc(m)}">`).join("");
 }
@@ -299,7 +303,7 @@ function renderRulePreview() {
   const c = result.diff.counts;
   const summary =
     `原规则 ${result.baseline.faults.length} 个故障 → 草稿 ${result.draft.faults.length} 个故障` +
-    `（当前 ${result.maintenance_windows} 个维护窗口参与评估；不落库，保存仍走原流程）`;
+    `（当前 ${result.maintenance_windows} 个维护窗口、${result.sample_ttls || 0} 个通道采样有效期参与评估；不落库，保存仍走原流程）`;
   const sections = [
     ["added", c.added],
     ["removed", c.removed],
@@ -434,6 +438,88 @@ async function deleteMaintenance(id) {
     await api(`/api/maintenance/${id}`, { method: "DELETE" });
     await reloadAll();
     toast("维护窗口已删除，规则已重新评估");
+  } catch (e) { toast(e.message, true); }
+}
+
+/* --------------------------- per-channel sample TTL --------------------------- */
+
+function ttlFor(device, metric) {
+  const hit = state.sampleTtls.find((t) => t.device === device && t.metric === metric);
+  return hit ? hit.ttl_seconds : null;
+}
+
+function renderTtls() {
+  const box = $("ttl-list");
+  if (!state.sampleTtls.length) {
+    box.innerHTML = `<div class="empty">未配置有效期：所有通道沿用默认样本保持（到下一样本/数据终点）。</div>`;
+    return;
+  }
+  box.innerHTML = state.sampleTtls.map((t) => `
+    <div class="maint-item ttl-item" data-device="${esc(t.device)}" data-metric="${esc(t.metric)}">
+      <div class="rname">
+        <span class="swatch" style="background:${TTL_COLOR}"></span>
+        <span class="pill">${esc(t.device)}/${esc(t.metric)}</span>
+        <span class="rule-ops">
+          <button class="icon-btn act-edit" title="编辑">✎</button>
+          <button class="icon-btn act-del" title="清除（恢复默认保持语义）">✕</button>
+        </span>
+      </div>
+      <div class="rmeta">有效期 ${fmtDur(t.ttl_seconds)} · 到期后空档不满足条件、重置持续时长</div>
+    </div>`).join("");
+
+  box.querySelectorAll(".ttl-item").forEach((el) => {
+    const device = el.dataset.device, metric = el.dataset.metric;
+    el.querySelector(".act-edit").addEventListener("click", (e) => {
+      e.stopPropagation();
+      openTtlEditor({ device, metric, ttl_seconds: ttlFor(device, metric) });
+    });
+    el.querySelector(".act-del").addEventListener("click", (e) => {
+      e.stopPropagation();
+      clearTtl(device, metric);
+    });
+  });
+}
+
+function openTtlEditor(preset = null) {
+  state.editingTtl = preset
+    ? { device: preset.device, metric: preset.metric, ttl_seconds: preset.ttl_seconds }
+    : null;
+  $("ttl-editor-title").textContent = preset ? "编辑采样有效期" : "设置采样有效期";
+  $("ttl-device").value = preset ? preset.device : "";
+  $("ttl-metric").value = preset ? preset.metric : "";
+  $("ttl-seconds").value = preset && preset.ttl_seconds != null ? preset.ttl_seconds : "";
+  $("ttl-editor").hidden = false;
+  $("ttl-seconds").focus();
+}
+
+function closeTtlEditor() {
+  state.editingTtl = null;
+  $("ttl-editor").hidden = true;
+}
+
+async function saveTtl() {
+  const device = $("ttl-device").value.trim();
+  const metric = $("ttl-metric").value.trim();
+  const ttl = Number($("ttl-seconds").value);
+  if (!device || !metric) { toast("请填写设备与指标", true); return; }
+  if (!Number.isFinite(ttl) || ttl <= 0) { toast("有效期必须是正秒数（> 0）", true); return; }
+  try {
+    const r = await api("/api/sample-ttls", {
+      method: "PUT",
+      body: JSON.stringify({ device, metric, ttl_seconds: ttl }),
+    });
+    closeTtlEditor();
+    await reloadAll();
+    toast(`已设置 ${device}/${metric} 有效期 ${fmtDur(r.ttl_seconds)}：已重算 ${r.evaluation.fault_intervals} 个故障区间`);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function clearTtl(device, metric) {
+  if (!confirm(`清除 ${device}/${metric} 的采样有效期？\n清除后该通道恢复默认保持语义（保持到下一样本/数据终点），并重新评估全部规则。`)) return;
+  try {
+    const r = await api(`/api/sample-ttls?${new URLSearchParams({ device, metric })}`, { method: "DELETE" });
+    await reloadAll();
+    toast(`已清除 ${device}/${metric} 有效期：已重算 ${r.evaluation.fault_intervals} 个故障区间`);
   } catch (e) { toast(e.message, true); }
 }
 
@@ -587,8 +673,16 @@ function renderTimeline() {
     const label = el("text", { x: TL.left - 8, y: laneY + TL.laneH / 2 + 4, "text-anchor": "end", class: "lane-label" });
     label.textContent = `${ch.device}/${ch.metric}`;
     g.appendChild(label);
-    const range = el("text", { x: TL.left - 8, y: laneY + TL.laneH / 2 + 17, "text-anchor": "end", class: "lane-label", "font-size": 9, fill: "#94a3b8" });
-    range.textContent = `${fmtNum(ch.min_value)}~${fmtNum(ch.max_value)}`;
+    const ttlSecs = ttlFor(ch.device, ch.metric);
+    const rangeText = ttlSecs != null
+      ? `${fmtNum(ch.min_value)}~${fmtNum(ch.max_value)} · TTL ${fmtDur(ttlSecs)}`
+      : `${fmtNum(ch.min_value)}~${fmtNum(ch.max_value)}`;
+    const range = el("text", {
+      x: TL.left - 8, y: laneY + TL.laneH / 2 + 17, "text-anchor": "end",
+      class: "lane-label", "font-size": 9,
+      fill: ttlSecs != null ? TTL_COLOR : "#94a3b8",
+    });
+    range.textContent = rangeText;
     g.appendChild(range);
 
     // threshold lines
@@ -1080,6 +1174,7 @@ function renderLegend() {
     `<span class="legend-item"><span class="swatch" style="background:${ANN_COLOR};opacity:0.5"></span>区间标注</span>
      <span class="legend-item"><span class="swatch" style="background:${MAINT_COLOR};opacity:0.55"></span>计划维护窗口（顶部维护带 + 设备泳道底色）</span>
      <span class="legend-item"><span class="swatch" style="background:${SUPP_COLOR};opacity:0.65"></span>被维护抑制的片段</span>
+     <span class="legend-item"><span class="swatch" style="background:${TTL_COLOR};opacity:0.7"></span>采样有效期 TTL（泳道标签紫色标注；到期空档不满足条件）</span>
      <span class="legend-item"><span style="color:#0f172a">▴</span> 故障确认时刻（start + 持续时长）</span>
      <span class="legend-item"><span style="color:#f97316">●</span> 选中故障的证据样本</span>`;
 }
@@ -1119,6 +1214,10 @@ async function loadChannels() {
   state.channels = await api("/api/channels");
 }
 
+async function loadTtls() {
+  state.sampleTtls = await api("/api/sample-ttls");
+}
+
 async function loadTimeline() {
   ensureView();
   const params = new URLSearchParams();
@@ -1149,6 +1248,7 @@ async function reloadAll() {
   await loadMeta();
   await loadRules();
   await loadChannels();
+  await loadTtls();
   await loadTimeline();
   await loadFaultEvents();
   state.selectedFaultId = null;
@@ -1159,6 +1259,7 @@ async function reloadAll() {
   renderFaultEvents();
   renderAnnotations();
   renderMaintenance();
+  renderTtls();
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
@@ -1313,6 +1414,10 @@ function bind() {
   $("btn-new-maint").addEventListener("click", () => openMaintEditor(null));
   $("btn-save-maint").addEventListener("click", saveMaintenance);
   $("btn-cancel-maint").addEventListener("click", closeMaintEditor);
+
+  $("btn-new-ttl").addEventListener("click", () => openTtlEditor(null));
+  $("btn-save-ttl").addEventListener("click", saveTtl);
+  $("btn-cancel-ttl").addEventListener("click", closeTtlEditor);
 
   $("btn-apply-filter").addEventListener("click", applyFilter);
   $("btn-clear-filter").addEventListener("click", clearFilter);

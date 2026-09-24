@@ -124,6 +124,20 @@ class MaintenanceIn(BaseModel):
         }
 
 
+class SampleTtlIn(BaseModel):
+    """Per-channel sample validity (positive seconds); PUT = insert/replace."""
+
+    device: str = Field(min_length=1, max_length=200)
+    metric: str = Field(min_length=1, max_length=200)
+    ttl_seconds: float = Field(gt=0)
+
+    def normalized(self) -> dict:
+        ttl = float(self.ttl_seconds)
+        if ttl != ttl or ttl in (float("inf"), float("-inf")):
+            raise HTTPException(status_code=400, detail="sample TTL must be a finite number of seconds")
+        return {"device": self.device.strip(), "metric": self.metric.strip(), "ttl_seconds": ttl}
+
+
 class ImportBody(BaseModel):
     text: str = ""
     filename: str | None = None
@@ -398,14 +412,7 @@ def _maintenance_response(window_id: int) -> dict:
     """Window payload plus the re-evaluation summary it triggered."""
     window = db.fetch_maintenance_window(window_id)
     evaluation = services.evaluate_all_rules()
-    return {
-        **window,
-        "evaluation": {
-            "rules_evaluated": evaluation["rules_evaluated"],
-            "fault_intervals": evaluation["fault_intervals"],
-            "suppressed_segments": evaluation["suppressed_segments"],
-        },
-    }
+    return {**window, "evaluation": services.evaluation_summary(evaluation)}
 
 
 @app.get("/api/maintenance")
@@ -455,20 +462,49 @@ def delete_maintenance(window_id: int) -> dict:
         raise HTTPException(status_code=404, detail="maintenance window not found")
     db.execute("DELETE FROM maintenance_windows WHERE id = ?", (window_id,))
     evaluation = services.evaluate_all_rules()
-    return {
-        "deleted": window_id,
-        "evaluation": {
-            "rules_evaluated": evaluation["rules_evaluated"],
-            "fault_intervals": evaluation["fault_intervals"],
-            "suppressed_segments": evaluation["suppressed_segments"],
-        },
-    }
+    return {"deleted": window_id, "evaluation": services.evaluation_summary(evaluation)}
 
 
 @app.get("/api/suppressed")
 def get_suppressed(start: str | None = None, end: str | None = None) -> list[dict]:
     """Segments where rule truth was suppressed by planned maintenance."""
     return services.query_suppressed(parse_bound(start), parse_bound(end))
+
+
+# --------------------------------------------------------------------------- #
+# Per-channel sample validity (TTL)
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/sample-ttls")
+def get_sample_ttls(
+    device: str | None = None, metric: str | None = None
+) -> list[dict]:
+    """List configured sample-validity windows (positive seconds per channel).
+
+    Channels absent from the list have no TTL configured and keep the
+    legacy sample-hold semantics.
+    """
+    return services.list_sample_ttls(device, metric)
+
+
+@app.put("/api/sample-ttls")
+def put_sample_ttl(payload: SampleTtlIn) -> dict:
+    """Set (insert/replace) one channel's sample validity; stored faults recompute."""
+    data = payload.normalized()
+    try:
+        return services.set_sample_ttl(data["device"], data["metric"], data["ttl_seconds"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/sample-ttls")
+def delete_sample_ttl(device: str = Query(..., min_length=1), metric: str = Query(..., min_length=1)) -> dict:
+    """Clear one channel's sample validity; the channel returns to legacy hold."""
+    try:
+        return services.clear_sample_ttl(device, metric)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -536,6 +572,7 @@ def export(
         "fault_events": services.query_fault_events(start_ts, end_ts),
         "maintenance_windows": maintenance,
         "suppressed_segments": suppressed,
+        "sample_ttls": db.fetch_sample_ttls(),
         "annotations": annotations,
     }
 

@@ -121,6 +121,36 @@
         </div>
       </section>
 
+      <section class="card">
+        <div class="card-head">
+          <h2>采样有效期</h2>
+          <button id="btn-new-ttl" class="btn btn-small">＋ 设置</button>
+        </div>
+        <div class="muted small maint-hint">
+          按「设备 / 指标」设置样本保持的有效期（正秒数）：样本值仅保持到
+          [采样时刻, min(下一样本时刻, 采样时刻+有效期, 数据终点))；到期空档不满足该通道条件、
+          重置持续时长，故障与证据不得跨越。清空后沿用默认（保持到下一样本/数据终点）。保存后自动重新评估。
+        </div>
+        <div id="ttl-list" class="maint-list"></div>
+
+        <div id="ttl-editor" hidden>
+          <h3 id="ttl-editor-title">设置采样有效期</h3>
+          <label class="field">设备
+            <input id="ttl-device" list="device-list" placeholder="例如：pump-1" />
+          </label>
+          <label class="field">指标
+            <input id="ttl-metric" list="metric-list" placeholder="例如：temp" />
+          </label>
+          <label class="field">有效期（秒，正数）
+            <input id="ttl-seconds" type="number" min="0" step="any" placeholder="例如：90" />
+          </label>
+          <div class="editor-actions">
+            <button id="btn-save-ttl" class="btn btn-primary">保存并重新评估</button>
+            <button id="btn-cancel-ttl" class="btn">取消</button>
+          </div>
+        </div>
+      </section>
+
       <datalist id="device-list"></datalist>
       <datalist id="metric-list"></datalist>
     </aside>

@@ -226,6 +226,9 @@ body {
 .maint-item .rname { font-weight: 600; display: flex; align-items: center; gap: 6px; }
 .maint-item .rmeta { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
+.ttl-item { border-left-color: #7c3aed; }
+.ttl-item:hover { border-color: #a78bfa; }
+
 .brush-kind { display: flex; gap: 12px; font-size: 12px; color: var(--muted); }
 .brush-kind label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
 .crosshair { stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }

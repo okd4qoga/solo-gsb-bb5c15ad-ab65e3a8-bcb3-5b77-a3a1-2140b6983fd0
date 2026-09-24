@@ -101,6 +101,15 @@ CREATE TABLE IF NOT EXISTS suppressed_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_supp_rule ON suppressed_segments(rule_id);
 CREATE INDEX IF NOT EXISTS idx_supp_ts ON suppressed_segments(start_ts, end_ts);
+
+CREATE TABLE IF NOT EXISTS sample_ttls (
+    device TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    ttl_seconds REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (device, metric)
+);
 """
 
 
@@ -171,6 +180,7 @@ def reset_all() -> None:
         "rules",
         "events",
         "imports",
+        "sample_ttls",
     ):
         conn.execute(f"DELETE FROM {table}")
     conn.commit()
@@ -302,3 +312,81 @@ def faults_for_export() -> list[dict]:
             }
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Per-channel sample validity (TTL)
+# --------------------------------------------------------------------------- #
+
+
+def fetch_sample_ttls(
+    device: str | None = None, metric: str | None = None
+) -> list[dict]:
+    """Configured per-channel sample validity windows (seconds).
+
+    Channels absent from the result have no TTL configured and keep the
+    legacy "held until the next sample / horizon" semantics.
+    """
+    where = []
+    params: list = []
+    if device is not None:
+        where.append("device = ?")
+        params.append(device)
+    if metric is not None:
+        where.append("metric = ?")
+        params.append(metric)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    rows = query(
+        f"SELECT device, metric, ttl_seconds, created_at, updated_at"
+        f" FROM sample_ttls{clause} ORDER BY device, metric",
+        params,
+    )
+    return [
+        {
+            "device": r["device"],
+            "metric": r["metric"],
+            "ttl_seconds": r["ttl_seconds"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
+
+
+def fetch_sample_ttl(device: str, metric: str) -> dict | None:
+    rows = fetch_sample_ttls(device, metric)
+    return rows[0] if rows else None
+
+
+def upsert_sample_ttl(device: str, metric: str, ttl_seconds: float, now: float) -> dict:
+    """Insert or replace the TTL of one channel (created_at preserved on update)."""
+    conn = get_conn()
+    with _write_lock:
+        existing = conn.execute(
+            "SELECT created_at FROM sample_ttls WHERE device = ? AND metric = ?",
+            (device, metric),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO sample_ttls (device, metric, ttl_seconds, created_at, updated_at)"
+                " VALUES (?,?,?,?,?)",
+                (device, metric, ttl_seconds, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE sample_ttls SET ttl_seconds = ?, updated_at = ?"
+                " WHERE device = ? AND metric = ?",
+                (ttl_seconds, now, device, metric),
+            )
+        conn.commit()
+    result = fetch_sample_ttl(device, metric)
+    assert result is not None
+    return result
+
+
+def delete_sample_ttl(device: str, metric: str) -> bool:
+    """Clear the TTL of one channel; returns True when a row existed."""
+    cur = execute(
+        "DELETE FROM sample_ttls WHERE device = ? AND metric = ?", (device, metric)
+    )
+    return cur.rowcount > 0
