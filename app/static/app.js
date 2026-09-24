@@ -10,6 +10,7 @@ const SUPP_COLOR = "#b45309";
 const state = {
   rules: [],
   channels: [],
+  channelTtls: [],
   dataStart: null,
   dataEnd: null,
   viewStart: null,
@@ -21,6 +22,7 @@ const state = {
   selectedFaultId: null,
   editingRuleId: null,
   editingMaintenanceId: null,
+  editingTtlKey: null,
   rulePreview: null,
   eventOffset: 0,
   eventLimit: 200,
@@ -299,7 +301,7 @@ function renderRulePreview() {
   const c = result.diff.counts;
   const summary =
     `原规则 ${result.baseline.faults.length} 个故障 → 草稿 ${result.draft.faults.length} 个故障` +
-    `（当前 ${result.maintenance_windows} 个维护窗口参与评估；不落库，保存仍走原流程）`;
+    `（当前 ${result.maintenance_windows} 个维护窗口、${result.channel_ttls || 0} 个采样有效期参与评估；不落库，保存仍走原流程）`;
   const sections = [
     ["added", c.added],
     ["removed", c.removed],
@@ -434,6 +436,97 @@ async function deleteMaintenance(id) {
     await api(`/api/maintenance/${id}`, { method: "DELETE" });
     await reloadAll();
     toast("维护窗口已删除，规则已重新评估");
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ----------------------- per-channel sample validity (TTL) ----------------------- */
+
+const TTL_COLOR = "#7c3aed";
+
+function ttlMap() {
+  const m = new Map();
+  state.channelTtls.forEach((t) => m.set(t.device + "|" + t.metric, t.ttl_seconds));
+  return m;
+}
+
+function renderTtls() {
+  const box = $("ttl-list");
+  const ttls = state.channelTtls || [];
+  if (!ttls.length) {
+    box.innerHTML = `<div class="empty">未配置有效期：所有通道沿用「样本值保持到下一样本（末样本保持到数据终点）」语义。</div>`;
+    return;
+  }
+  box.innerHTML = ttls.map((t) => `
+    <div class="maint-item" data-device="${esc(t.device)}" data-metric="${esc(t.metric)}">
+      <div class="rname">
+        <span class="swatch" style="background:${TTL_COLOR}"></span>
+        <span>${esc(t.device)}/${esc(t.metric)}</span>
+        <span class="rule-ops">
+          <button class="icon-btn act-edit" title="编辑">✎</button>
+          <button class="icon-btn act-del" title="清除有效期">✕</button>
+        </span>
+      </div>
+      <div class="rmeta">样本有效期 <b>${fmtDur(t.ttl_seconds)}</b>（${Number(t.ttl_seconds)} 秒）· 到期空档不计条件、重置持续时长</div>
+    </div>`).join("");
+
+  box.querySelectorAll(".maint-item").forEach((el) => {
+    const device = el.dataset.device, metric = el.dataset.metric;
+    el.querySelector(".act-edit").addEventListener("click", (e) => { e.stopPropagation(); openTtlEditor(device, metric); });
+    el.querySelector(".act-del").addEventListener("click", (e) => { e.stopPropagation(); clearTtl(device, metric); });
+    el.addEventListener("click", () => openTtlEditor(device, metric));
+  });
+}
+
+function openTtlEditor(device = null, metric = null) {
+  const ttl = device !== null ? (state.channelTtls || []).find((t) => t.device === device && t.metric === metric) : null;
+  state.editingTtlKey = ttl ? { device: ttl.device, metric: ttl.metric } : null;
+  $("ttl-editor-title").textContent = ttl ? "编辑采样有效期" : "设置采样有效期";
+  $("ttl-device").value = ttl ? ttl.device : device || "";
+  $("ttl-metric").value = ttl ? ttl.metric : metric || "";
+  $("ttl-seconds").value = ttl ? ttl.ttl_seconds : "";
+  $("btn-clear-ttl").hidden = !ttl;
+  $("ttl-editor").hidden = false;
+  $("ttl-seconds").focus();
+}
+
+function closeTtlEditor() {
+  state.editingTtlKey = null;
+  $("ttl-editor").hidden = true;
+}
+
+function collectTtl() {
+  const device = $("ttl-device").value.trim();
+  const metric = $("ttl-metric").value.trim();
+  const seconds = Number($("ttl-seconds").value);
+  if (!device || !metric) throw new Error("请填写设备与指标");
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("有效期必须为正秒数");
+  return { device, metric, ttl_seconds: seconds };
+}
+
+async function saveTtl() {
+  let payload;
+  try {
+    payload = collectTtl();
+  } catch (e) { toast(e.message, true); return; }
+  try {
+    await api("/api/channel-ttls", { method: "PUT", body: JSON.stringify(payload) });
+    closeTtlEditor();
+    await reloadAll();
+    toast("采样有效期已保存，规则已重新评估");
+  } catch (e) { toast(e.message, true); }
+}
+
+async function clearTtl(device, metric) {
+  const label = `${device}/${metric}`;
+  if (!confirm(`清除通道 ${label} 的采样有效期？清除后沿用「保持到下一样本」语义，并重新评估全部规则。`)) return;
+  try {
+    const params = new URLSearchParams({ device, metric });
+    await api(`/api/channel-ttls?${params}`, { method: "DELETE" });
+    if (state.editingTtlKey && state.editingTtlKey.device === device && state.editingTtlKey.metric === metric) {
+      closeTtlEditor();
+    }
+    await reloadAll();
+    toast(`已清除 ${label} 的有效期，规则已重新评估`);
   } catch (e) { toast(e.message, true); }
 }
 
@@ -590,6 +683,20 @@ function renderTimeline() {
     const range = el("text", { x: TL.left - 8, y: laneY + TL.laneH / 2 + 17, "text-anchor": "end", class: "lane-label", "font-size": 9, fill: "#94a3b8" });
     range.textContent = `${fmtNum(ch.min_value)}~${fmtNum(ch.max_value)}`;
     g.appendChild(range);
+
+    // per-channel sample validity badge (TTL): value held only ttl seconds
+    const ttlSec = ttlMap().get(ch.device + "|" + ch.metric);
+    if (ttlSec !== undefined) {
+      const bx = TL.left + 6, by = laneY + 4;
+      const bw = 74, bh = 13;
+      const badge = el("g", { class: "ttl-badge" });
+      badge.appendChild(el("rect", { x: bx, y: by, width: bw, height: bh, rx: 6, fill: TTL_COLOR, "fill-opacity": 0.14, stroke: TTL_COLOR, "stroke-opacity": 0.45, "stroke-width": 0.8 }));
+      badge.appendChild(el("text", { x: bx + bw / 2, y: by + 9.5, "text-anchor": "middle", "font-size": 9, fill: TTL_COLOR, text: `⏳ 有效期 ${fmtDur(ttlSec)}` }));
+      attachTip(badge, () =>
+        `采样有效期：${ch.device}/${ch.metric} 每个样本值仅保持 ${fmtDur(ttlSec)}（${Number(ttlSec)} 秒）\n` +
+        `持有区间 [采样时刻, min(下一样本时刻, 采样时刻+有效期, 数据终点))；\n到期空档不满足该通道条件并重置持续时长，故障与证据不跨越空档。`);
+      g.appendChild(badge);
+    }
 
     // threshold lines
     const thItems = thresholds.get(ch.device + "|" + ch.metric) || [];
@@ -1080,6 +1187,7 @@ function renderLegend() {
     `<span class="legend-item"><span class="swatch" style="background:${ANN_COLOR};opacity:0.5"></span>区间标注</span>
      <span class="legend-item"><span class="swatch" style="background:${MAINT_COLOR};opacity:0.55"></span>计划维护窗口（顶部维护带 + 设备泳道底色）</span>
      <span class="legend-item"><span class="swatch" style="background:${SUPP_COLOR};opacity:0.65"></span>被维护抑制的片段</span>
+     <span class="legend-item"><span class="swatch" style="background:${TTL_COLOR};opacity:0.45"></span>采样有效期（TTL）：泳道 ⏳ 徽标表示样本到期后留空档</span>
      <span class="legend-item"><span style="color:#0f172a">▴</span> 故障确认时刻（start + 持续时长）</span>
      <span class="legend-item"><span style="color:#f97316">●</span> 选中故障的证据样本</span>`;
 }
@@ -1150,6 +1258,7 @@ async function reloadAll() {
   await loadRules();
   await loadChannels();
   await loadTimeline();
+  state.channelTtls = state.timeline.channel_ttls || [];
   await loadFaultEvents();
   state.selectedFaultId = null;
   state.expandedEventId = null;
@@ -1159,6 +1268,7 @@ async function reloadAll() {
   renderFaultEvents();
   renderAnnotations();
   renderMaintenance();
+  renderTtls();
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
@@ -1248,9 +1358,12 @@ async function doImport() {
       return;
     }
     result.className = "import-result ok";
-    result.textContent = `导入完成：${res.inserted} 新增，${res.overwritten} 覆盖，${res.skipped} 跳过（共 ${res.total_rows} 行）`;
+    const evalNote = res.evaluation && res.evaluation.rules_evaluated
+      ? `；已重算 ${res.evaluation.rules_evaluated} 条规则、${res.evaluation.fault_intervals} 个故障区间`
+      : "";
+    result.textContent = `导入完成：${res.inserted} 新增，${res.overwritten} 覆盖，${res.skipped} 跳过（共 ${res.total_rows} 行）${evalNote}`;
     await reloadAll();
-    toast("导入成功");
+    toast("导入成功" + evalNote);
   } catch (e) {
     result.className = "import-result err";
     result.textContent = "导入失败：" + e.message;
@@ -1313,6 +1426,14 @@ function bind() {
   $("btn-new-maint").addEventListener("click", () => openMaintEditor(null));
   $("btn-save-maint").addEventListener("click", saveMaintenance);
   $("btn-cancel-maint").addEventListener("click", closeMaintEditor);
+
+  $("btn-new-ttl").addEventListener("click", () => openTtlEditor(null));
+  $("btn-save-ttl").addEventListener("click", saveTtl);
+  $("btn-clear-ttl").addEventListener("click", () => {
+    const k = state.editingTtlKey;
+    if (k) clearTtl(k.device, k.metric);
+  });
+  $("btn-cancel-ttl").addEventListener("click", closeTtlEditor);
 
   $("btn-apply-filter").addEventListener("click", applyFilter);
   $("btn-clear-filter").addEventListener("click", clearFilter);

@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Iterable
 
@@ -101,6 +102,14 @@ CREATE TABLE IF NOT EXISTS suppressed_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_supp_rule ON suppressed_segments(rule_id);
 CREATE INDEX IF NOT EXISTS idx_supp_ts ON suppressed_segments(start_ts, end_ts);
+
+CREATE TABLE IF NOT EXISTS channel_ttls (
+    device TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    ttl_seconds REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (device, metric)
+);
 """
 
 
@@ -171,6 +180,7 @@ def reset_all() -> None:
         "rules",
         "events",
         "imports",
+        "channel_ttls",
     ):
         conn.execute(f"DELETE FROM {table}")
     conn.commit()
@@ -302,3 +312,69 @@ def faults_for_export() -> list[dict]:
             }
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Per-channel sample validity periods (TTL)
+# --------------------------------------------------------------------------- #
+
+
+def fetch_channel_ttl(device: str, metric: str) -> dict | None:
+    row = query_one(
+        "SELECT * FROM channel_ttls WHERE device = ? AND metric = ?",
+        (device, metric),
+    )
+    if row is None:
+        return None
+    return {
+        "device": row["device"],
+        "metric": row["metric"],
+        "ttl_seconds": row["ttl_seconds"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def fetch_channel_ttls(
+    device: str | None = None, metric: str | None = None
+) -> list[dict]:
+    """All configured sample validity periods; channels without a row are absent
+    (they keep the legacy hold-to-next-sample semantics)."""
+    where = []
+    params: list = []
+    if device is not None:
+        where.append("device = ?")
+        params.append(device)
+    if metric is not None:
+        where.append("metric = ?")
+        params.append(metric)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    rows = query(
+        f"SELECT device, metric, ttl_seconds, updated_at FROM channel_ttls{clause}"
+        " ORDER BY device, metric",
+        params,
+    )
+    return [dict(r) for r in rows]
+
+
+def upsert_channel_ttl(device: str, metric: str, ttl_seconds: float) -> dict:
+    """Set (or replace) a channel's positive sample validity period."""
+    execute(
+        """
+        INSERT INTO channel_ttls (device, metric, ttl_seconds, updated_at)
+        VALUES (?,?,?,?)
+        ON CONFLICT(device, metric) DO UPDATE SET
+            ttl_seconds = excluded.ttl_seconds,
+            updated_at = excluded.updated_at
+        """,
+        (device, metric, float(ttl_seconds), time.time()),
+    )
+    return fetch_channel_ttl(device, metric)
+
+
+def delete_channel_ttl(device: str, metric: str) -> bool:
+    """Clear a channel's validity period; returns True when a row was removed."""
+    cur = execute(
+        "DELETE FROM channel_ttls WHERE device = ? AND metric = ?",
+        (device, metric),
+    )
+    return cur.rowcount > 0

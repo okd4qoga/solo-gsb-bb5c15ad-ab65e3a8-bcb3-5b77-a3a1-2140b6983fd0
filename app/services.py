@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections import defaultdict
 
@@ -87,6 +88,7 @@ def import_events(
     metric_field: str = DEFAULT_METRIC_FIELD,
     ts_field: str = DEFAULT_TS_FIELD,
     value_field: str = DEFAULT_VALUE_FIELD,
+    reevaluate: bool = True,
 ) -> dict:
     rows = parse_jsonl(text)
     now = time.time()
@@ -130,7 +132,7 @@ def import_events(
             (inserted, len(skipped), import_id),
         )
 
-    return {
+    result = {
         "import_id": import_id,
         "total_rows": len(rows),
         "inserted": inserted,
@@ -138,6 +140,17 @@ def import_events(
         "skipped": len(skipped),
         "skipped_details": skipped[:100],
     }
+    # New or back-filled samples — including older timestamps — change held
+    # intervals and can bridge or open TTL gaps, so stored faults are
+    # recomputed immediately (maintenance windows keep participating).
+    if reevaluate:
+        evaluation = evaluate_all_rules()
+        result["evaluation"] = {
+            "rules_evaluated": evaluation["rules_evaluated"],
+            "fault_intervals": evaluation["fault_intervals"],
+            "suppressed_segments": evaluation["suppressed_segments"],
+        }
+    return result
 
 
 def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | None]:
@@ -172,12 +185,26 @@ def _load_maintenance_windows() -> list[MaintenanceWindow]:
     ]
 
 
+def _load_channel_ttls() -> dict[tuple[str, str], float]:
+    """Configured per-channel sample validity periods as engine input.
+
+    Only channels with a positive configured TTL appear here; every other
+    channel keeps the legacy hold-to-next-sample / hold-to-horizon semantics.
+    """
+    return {
+        (row["device"], row["metric"]): row["ttl_seconds"]
+        for row in db.fetch_channel_ttls()
+    }
+
+
 def evaluate_all_rules() -> dict:
     """Re-evaluate every rule and replace its stored fault intervals.
 
     Planned-maintenance windows are merged per device and subtracted from the
     truth segments before the duration check, so a maintenance interruption
     resets the sustained duration and re-arms confirmation after the window.
+    Per-channel sample validity periods cap each sample's held interval, so
+    expired stretches satisfy no condition and likewise reset the duration.
     The suppressed pieces are stored alongside for the timeline/export.
     """
     rules = db.fetch_rules()
@@ -185,6 +212,7 @@ def evaluate_all_rules() -> dict:
     if horizon is None:
         horizon = 0.0
     maintenance = _load_maintenance_windows()
+    ttl_by_channel = _load_channel_ttls()
 
     total = 0
     total_suppressed = 0
@@ -200,6 +228,7 @@ def evaluate_all_rules() -> dict:
                 events_by_channel=events_by_channel,
                 horizon=horizon,
                 maintenance=maintenance,
+                ttl_by_channel=ttl_by_channel,
             )
             tx.execute("DELETE FROM fault_intervals WHERE rule_id = ?", (rule["id"],))
             tx.execute("DELETE FROM suppressed_segments WHERE rule_id = ?", (rule["id"],))
@@ -271,15 +300,17 @@ def preview_rule(rule_id: int | None, draft: dict) -> dict:
 
     The baseline is the rule *as currently stored* (or nothing for a new
     rule), the candidate is the unsaved draft.  Both are evaluated right now
-    with the current events and the currently stored planned-maintenance
-    windows — exactly what a save + re-evaluation would see — but nothing is
-    written to the rules or fault tables.  The two confirmed fault sets are
-    compared as half-open interval coverings (see :func:`diff_faults`).
+    with the current events, the currently stored planned-maintenance windows
+    and the configured per-channel sample validity periods — exactly what a
+    save + re-evaluation would see — but nothing is written to the rules or
+    fault tables.  The two confirmed fault sets are compared as half-open
+    interval coverings (see :func:`diff_faults`).
     """
     events_by_channel, horizon = _load_events_index()
     if horizon is None:
         horizon = 0.0
     maintenance = _load_maintenance_windows()
+    ttl_by_channel = _load_channel_ttls()
 
     baseline_rule = db.fetch_rule(rule_id) if rule_id is not None else None
     if rule_id is not None and baseline_rule is None:
@@ -294,6 +325,7 @@ def preview_rule(rule_id: int | None, draft: dict) -> dict:
             events_by_channel=events_by_channel,
             horizon=horizon,
             maintenance=maintenance,
+            ttl_by_channel=ttl_by_channel,
         )
 
     baseline_result = (
@@ -319,6 +351,7 @@ def preview_rule(rule_id: int | None, draft: dict) -> dict:
             "faults": [_fault_outline(f) for f in draft_result.faults],
         },
         "maintenance_windows": len(maintenance),
+        "channel_ttls": len(ttl_by_channel),
         "diff": {
             "segments": [seg.to_dict() for seg in segments],
             "counts": counts,
@@ -337,6 +370,53 @@ def list_channels() -> list[dict]:
         """
     )
     return [dict(r) for r in rows]
+
+
+def list_channel_ttls() -> list[dict]:
+    """Configured per-channel sample validity periods (positive seconds).
+
+    Channels absent from the list have no TTL and keep legacy hold semantics.
+    """
+    return db.fetch_channel_ttls()
+
+
+def set_channel_ttl(device: str, metric: str, ttl_seconds: float) -> dict:
+    """Set/replace a channel's sample validity period and re-evaluate rules.
+
+    Changing the TTL changes how every rule using the channel expands its
+    samples, so the stored fault intervals are recomputed immediately.
+    Planned maintenance keeps participating in the evaluation as usual.
+    """
+    ttl_seconds = float(ttl_seconds)
+    if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+        raise ValueError("ttl_seconds must be a positive number of seconds")
+    saved = db.upsert_channel_ttl(device, metric, ttl_seconds)
+    evaluation = evaluate_all_rules()
+    return {
+        **saved,
+        "evaluation": {
+            "rules_evaluated": evaluation["rules_evaluated"],
+            "fault_intervals": evaluation["fault_intervals"],
+            "suppressed_segments": evaluation["suppressed_segments"],
+        },
+    }
+
+
+def clear_channel_ttl(device: str, metric: str) -> dict:
+    """Remove a channel's validity period (back to legacy semantics) and re-evaluate."""
+    existed = db.fetch_channel_ttl(device, metric)
+    removed = db.delete_channel_ttl(device, metric)
+    if not removed:
+        raise KeyError(f"no sample validity configured for channel {device}/{metric}")
+    evaluation = evaluate_all_rules()
+    return {
+        "cleared": {"device": device, "metric": metric, "had_ttl_seconds": existed["ttl_seconds"]},
+        "evaluation": {
+            "rules_evaluated": evaluation["rules_evaluated"],
+            "fault_intervals": evaluation["fault_intervals"],
+            "suppressed_segments": evaluation["suppressed_segments"],
+        },
+    }
 
 
 def list_events(
@@ -634,6 +714,7 @@ def timeline_data(start: float | None, end: float | None, max_points: int = 400)
     bounds = db.query_one("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM events")
     return {
         "channels": channel_payload,
+        "channel_ttls": db.fetch_channel_ttls(),
         "faults": query_faults(start, end),
         "annotations": query_annotations(start, end),
         "maintenance": db.fetch_maintenance_windows(start, end),

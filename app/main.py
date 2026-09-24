@@ -124,6 +124,20 @@ class MaintenanceIn(BaseModel):
         }
 
 
+class ChannelTtlIn(BaseModel):
+    """Per-channel sample validity period; a positive number of seconds."""
+
+    device: str = Field(min_length=1, max_length=200)
+    metric: str = Field(min_length=1, max_length=200)
+    ttl_seconds: float = Field(gt=0)
+
+    def normalized(self) -> dict:
+        ttl = float(self.ttl_seconds)
+        if ttl == float("inf") or ttl != ttl:  # reject inf / NaN
+            raise HTTPException(status_code=400, detail="ttl_seconds must be a finite positive number")
+        return {"device": self.device.strip(), "metric": self.metric.strip(), "ttl_seconds": ttl}
+
+
 class ImportBody(BaseModel):
     text: str = ""
     filename: str | None = None
@@ -472,6 +486,49 @@ def get_suppressed(start: str | None = None, end: str | None = None) -> list[dic
 
 
 # --------------------------------------------------------------------------- #
+# Per-channel sample validity periods (TTL)
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/channel-ttls")
+def get_channel_ttls(
+    device: str | None = None, metric: str | None = None
+) -> list[dict]:
+    """Configured sample validity periods (positive seconds) per channel.
+
+    Channels without an entry keep the legacy hold-to-next-sample semantics.
+    """
+    return db.fetch_channel_ttls(device, metric)
+
+
+@app.put("/api/channel-ttls")
+def put_channel_ttl(payload: ChannelTtlIn) -> dict:
+    """Set or replace one channel's sample validity period.
+
+    Stored fault intervals are recomputed afterwards (maintenance windows
+    keep participating in the evaluation).
+    """
+    data = payload.normalized()
+    try:
+        return services.set_channel_ttl(data["device"], data["metric"], data["ttl_seconds"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/channel-ttls")
+def delete_channel_ttl(device: str = Query(..., min_length=1), metric: str = Query(..., min_length=1)) -> dict:
+    """Clear one channel's validity period (revert to legacy semantics).
+
+    Returns 404 when the channel had no configured period; stored faults are
+    recomputed afterwards.
+    """
+    try:
+        return services.clear_channel_ttl(device.strip(), metric.strip())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+
+
+# --------------------------------------------------------------------------- #
 # Timeline / export / reset
 # --------------------------------------------------------------------------- #
 
@@ -536,6 +593,7 @@ def export(
         "fault_events": services.query_fault_events(start_ts, end_ts),
         "maintenance_windows": maintenance,
         "suppressed_segments": suppressed,
+        "channel_ttls": db.fetch_channel_ttls(),
         "annotations": annotations,
     }
 
@@ -577,7 +635,8 @@ def demo() -> dict:
         "overwritten": result["overwritten"],
         "skipped": result["skipped"],
         "rules_created": created,
-        "note": "规则已创建，点击「评估规则」生成故障区间（本接口不自动评估）",
+        "evaluation": result.get("evaluation"),
+        "note": "示例导入后已自动重算已有规则；新建的示例规则请点击「评估规则」生成故障区间",
     }
 
 

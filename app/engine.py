@@ -5,6 +5,13 @@ held from its own timestamp up to (but excluding) the timestamp of the next
 sample on the same channel — i.e. every piece of the derived truth model is a
 half-open interval ``[start, end)``.
 
+A channel may additionally carry a positive **sample validity period (TTL)**
+configured per ``(device, metric)``.  With a TTL of ``s`` seconds the value of
+a sample taken at ``tᵢ`` is held only on
+``[tᵢ, min(tᵢ₊₁, tᵢ + s, horizon))``; the open stretch after that is an
+invalid gap during which the channel satisfies no condition.  Channels
+without a TTL keep the legacy hold-to-next-sample / hold-to-horizon semantics.
+
 Touching half-open intervals (``[a, b)`` followed by ``[b, c)``) are
 consecutive: a sweep-line that emits a segment only when the truth value
 actually changes merges them automatically, never emitting a zero-length
@@ -343,14 +350,27 @@ class RuleEvaluation:
 
 
 def channel_held_intervals(
-    events: list[Event], condition: Condition, horizon: float
+    events: list[Event],
+    condition: Condition,
+    horizon: float,
+    ttl: float | None = None,
 ) -> tuple[list[Interval], list[Event]]:
     """Return ([start,end) intervals where the predicate held], witnessing events).
 
     A sample's value is held on ``[sample.ts, next_sample.ts)``; the last sample
     is held through ``horizon`` (the timestamp of the newest event in the whole
     dataset). Equal timestamps keep the last supplied value.
+
+    When ``ttl`` is a positive number of seconds, the hold is capped:
+    ``[sample.ts, min(next_sample.ts, sample.ts + ttl, horizon))``.  Whatever
+    remains after the cap is an *invalid gap* (no held value at all), so the
+    condition drops out of AND/OR combinations there and any truth interruption
+    makes the sustained duration re-accumulate from scratch.
     """
+    ttl = float(ttl) if ttl is not None else None
+    if ttl is not None and ttl <= 0:
+        raise ValueError("sample validity (ttl) must be a positive number of seconds")
+
     ordered: list[Event] = []
     for ev in sorted(events, key=lambda e: (e.ts, e.id)):
         if ordered and ordered[-1].ts == ev.ts:
@@ -362,6 +382,8 @@ def channel_held_intervals(
     witnesses: list[Event] = []
     for i, ev in enumerate(ordered):
         seg_end = ordered[i + 1].ts if i + 1 < len(ordered) else horizon
+        if ttl is not None:
+            seg_end = min(seg_end, ev.ts + ttl, horizon)
         if seg_end <= ev.ts:
             continue
         if compare(ev.value, condition.op, condition.threshold):
@@ -383,8 +405,18 @@ def evaluate_rule(
     events_by_channel: dict[tuple[str, str], list[Event]],
     horizon: float,
     maintenance: list[MaintenanceWindow] | None = None,
+    ttl_by_channel: dict[tuple[str, str], float] | None = None,
 ) -> RuleEvaluation:
     """Evaluate one rule against indexed channel data.
+
+    Per-channel **sample validity periods** (``ttl_by_channel``) cap each
+    sample's held interval to ``[ts, min(next ts, ts + ttl, horizon))``;
+    invalid gaps satisfy none of the rule's conditions, so an AND rule drops
+    out for their whole duration while an OR rule survives only while another
+    channel still holds.  Either way the truth interruption splits the merged
+    truth segments, which re-accumulates the sustained duration from each
+    surviving segment's start, and fault intervals, confirmation instants and
+    trigger evidence can never cross an invalid gap.
 
     Planned maintenance is applied *before* combining conditions: per device,
     overlapping or touching windows are merged into maximal half-open spans,
@@ -407,6 +439,7 @@ def evaluate_rule(
     if not conditions:
         return RuleEvaluation()
 
+    ttl_by_channel = ttl_by_channel or {}
     windows = maintenance or []
     merged_by_device = merge_device_windows(
         (w.device, w.start, w.end) for w in windows
@@ -421,7 +454,10 @@ def evaluate_rule(
     witnesses_per: list[list[Event]] = []
     for cond in conditions:
         ivs, witnesses = channel_held_intervals(
-            events_by_channel.get(cond.channel, []), cond, horizon
+            events_by_channel.get(cond.channel, []),
+            cond,
+            horizon,
+            ttl=ttl_by_channel.get(cond.channel),
         )
         raw_held_per.append(ivs)
         maint = merged_by_device.get(str(cond.device))
